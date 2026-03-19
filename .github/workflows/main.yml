@@ -1,0 +1,43 @@
+name: KNU Dormitory Notice Bot
+
+on:
+  schedule:
+    - cron: '0 * * * *' # 매시간 정각(0분)에 1번씩 실행 (UTC 기준)
+  workflow_dispatch: # GitHub 웹페이지에서 수동으로 실행할 수 있는 버튼 활성화
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    # 워크플로우가 저장소에 코드를 다시 Commit 할 수 있도록 쓰기 권한 부여
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.x'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests beautifulsoup4 selenium webdriver-manager
+
+    - name: Run crawler script
+      env:
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        CHAT_ID: ${{ secrets.CHAT_ID }}
+      run: python bot.py
+
+    - name: Commit and push tracking files
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git add last_num.txt chat_ids.txt
+        # 변경사항이 있을 때만 commit 및 push를 수행합니다.
+        git commit -m "Update tracking files automatically" || echo "No changes to commit"
+        git push
