@@ -1,5 +1,5 @@
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 import os
 import sys
 import time
@@ -17,6 +17,7 @@ CHAT_IDS_FILE = "chat_ids.txt"
 BOARD_URL = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_MARKDOWN_BLOCK_LIMIT = 3500
 # =============================================
 
 def update_subscribers():
@@ -82,19 +83,219 @@ def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
     return chunks
 
 
+def escape_markdown_v2(text):
+    """텔레그램 MarkdownV2에서 특별한 의미를 갖는 문자를 이스케이프합니다."""
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!\\])', r'\\\1', str(text))
+
+
+def escape_markdown_url(url):
+    """Markdown 링크 URL 내부에서 필요한 문자만 이스케이프합니다."""
+    return str(url).replace("\\", "\\\\").replace(")", "\\)")
+
+
+def wrap_markdown(text, marker):
+    """앞뒤 공백은 서식 밖에 두어 Markdown 파싱 오류를 방지합니다."""
+    if not text or not text.strip():
+        return text
+    leading = text[:len(text) - len(text.lstrip())]
+    trailing = text[len(text.rstrip()):]
+    core = text.strip()
+    return f"{leading}{marker}{core}{marker}{trailing}"
+
+
+def get_markdown_styles(node):
+    """HTML 태그와 인라인 CSS에서 Telegram이 지원하는 서식을 찾습니다."""
+    styles = set()
+    name = node.name.lower()
+    if name in {"strong", "b", "h1", "h2", "h3", "h4", "h5", "h6"}:
+        styles.add("bold")
+    if name in {"em", "i"}:
+        styles.add("italic")
+    if name == "u":
+        styles.add("underline")
+    if name in {"s", "strike", "del"}:
+        styles.add("strikethrough")
+
+    style = re.sub(r"\s+", "", node.get("style", "").lower())
+    if "font-style:italic" in style:
+        styles.add("italic")
+    if (
+        "font-weight:bold" in style
+        or re.search(r"font-weight:[6-9]00", style)
+    ):
+        styles.add("bold")
+    if (
+        "text-decoration:underline" in style
+        or "text-decoration-line:underline" in style
+    ):
+        styles.add("underline")
+    if (
+        "text-decoration:line-through" in style
+        or "text-decoration-line:line-through" in style
+    ):
+        styles.add("strikethrough")
+    return styles
+
+
+def apply_markdown_styles(text, styles):
+    """서식 마커를 항상 같은 순서로 적용해 중첩을 안정적으로 만듭니다."""
+    markers = (
+        ("italic", "_"),
+        ("bold", "*"),
+        ("underline", "__"),
+        ("strikethrough", "~"),
+    )
+    for style, marker in markers:
+        if style in styles:
+            text = wrap_markdown(text, marker)
+    return text
+
+
+def render_telegram_markdown(node, base_url="", active_styles=frozenset()):
+    """게시글 HTML 노드를 Telegram MarkdownV2 문자열로 변환합니다."""
+    if isinstance(node, NavigableString):
+        text = str(node).replace("\xa0", " ")
+        return escape_markdown_v2(re.sub(r"\s+", " ", text))
+    if not isinstance(node, Tag):
+        return ""
+
+    name = node.name.lower()
+    if name in {"script", "style", "img"}:
+        return ""
+    if name == "br":
+        return "\n"
+    if name == "hr":
+        return "──────────\n\n"
+    if name == "pre":
+        code = node.get_text().replace("\\", "\\\\").replace("`", "\\`").strip()
+        return f"```\n{code}\n```\n\n"
+    if name == "code":
+        code = node.get_text().replace("\\", "\\\\").replace("`", "\\`")
+        return f"`{code}`"
+
+    if name == "tr":
+        cells = [
+            render_telegram_markdown(cell, base_url, active_styles).strip()
+            for cell in node.find_all(["th", "td"], recursive=False)
+        ]
+        return " │ ".join(cell for cell in cells if cell) + "\n\n"
+
+    node_styles = get_markdown_styles(node)
+    new_styles = node_styles - active_styles
+    child_styles = active_styles | node_styles
+    children = "".join(
+        render_telegram_markdown(child, base_url, child_styles)
+        for child in node.children
+    )
+
+    if name == "a":
+        href = node.get("href", "").strip()
+        if href and not href.startswith(("#", "javascript:")):
+            label = children.strip() or escape_markdown_v2(href)
+            children = f"[{label}]({escape_markdown_url(urljoin(base_url, href))})"
+
+    children = apply_markdown_styles(children, new_styles)
+
+    if name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+        return f"{children.strip()}\n\n"
+    if name == "blockquote":
+        quoted = "\n".join(f">{line}" for line in children.strip().splitlines())
+        return f"{quoted}\n\n"
+    if name == "li":
+        return f"• {children.strip()}\n\n"
+    if name in {"p", "div", "section", "article"}:
+        return f"{children.strip()}\n\n" if children.strip() else ""
+    if name in {"table", "thead", "tbody", "tfoot", "ul", "ol"}:
+        return children
+
+    return children
+
+
+def markdown_v2_to_plain(text):
+    """전송 실패 시 사용할 수 있도록 MarkdownV2 문법을 일반 텍스트로 되돌립니다."""
+    text = re.sub(r"(?m)^>", "", text)
+    text = re.sub(r"(?<!\\)(?:```|[*_~`])", "", text)
+    return re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', text)
+
+
+def plain_text_to_markdown_blocks(text, limit=TELEGRAM_MARKDOWN_BLOCK_LIMIT):
+    """긴 일반 텍스트를 이스케이프된 Markdown 블록들로 변환합니다."""
+    pending = split_message(text, max(1, limit // 2))
+    blocks = []
+    for piece in pending:
+        escaped = escape_markdown_v2(piece)
+        if len(escaped) <= limit:
+            blocks.append(escaped)
+            continue
+        midpoint = max(1, len(piece) // 2)
+        blocks.extend(plain_text_to_markdown_blocks(piece[:midpoint], limit))
+        blocks.extend(plain_text_to_markdown_blocks(piece[midpoint:], limit))
+    return blocks
+
+
+def html_content_to_markdown_blocks(content_element, base_url=""):
+    """HTML 본문을 서식 경계가 보존된 Telegram MarkdownV2 블록으로 변환합니다."""
+    if not content_element:
+        return []
+
+    content = BeautifulSoup(str(content_element), "html.parser")
+    rendered = render_telegram_markdown(content, base_url)
+    # 같은 서식의 인접 span들이 각각 닫히고 열리며 생긴 빈 마커를 하나로 합칩니다.
+    for _ in range(3):
+        rendered = re.sub(r"(?<!\\)_{4}", "", rendered)
+        rendered = re.sub(r"(?<!\\)\*{2}", "", rendered)
+        rendered = re.sub(r"(?<!\\)~{2}", "", rendered)
+    rendered = re.sub(r"[ \t]+\n", "\n", rendered)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered).strip()
+
+    blocks = []
+    for block in rendered.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+        if len(block) <= TELEGRAM_MARKDOWN_BLOCK_LIMIT:
+            blocks.append(block)
+        else:
+            blocks.extend(plain_text_to_markdown_blocks(markdown_v2_to_plain(block)))
+    return blocks
+
+
 def build_notice_messages(post):
-    """제목, 전체 본문, 원문 링크를 텔레그램 메시지들로 만듭니다."""
-    body = post.get("content", "").strip() or "(본문 내용 없음)"
-    text = f"📢 {post['title']}\n\n{body}\n\n🔗 원문 보기\n{post['link']}"
-    return split_message(text)
+    """제목, 서식이 유지된 본문, 원문 링크를 제한 길이에 맞춰 묶습니다."""
+    body_blocks = post.get("content_markdown_blocks")
+    if body_blocks is None:
+        body = post.get("content", "").strip() or "(본문 내용 없음)"
+        body_blocks = plain_text_to_markdown_blocks(body)
+
+    blocks = [
+        f"📢 *{escape_markdown_v2(post['title'])}*",
+        *body_blocks,
+        f"🔗 [원문 보기]({escape_markdown_url(post['link'])})",
+    ]
+    messages = []
+    current = ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if current and len(candidate) > TELEGRAM_MESSAGE_LIMIT:
+            messages.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        messages.append(current)
+    return messages
 
 
 def send_telegram_message(text, chat_ids):
-    """여러 사용자에게 메시지를 전송합니다."""
+    """여러 사용자에게 MarkdownV2 메시지를 전송합니다."""
     succeeded = True
     for chat_id in chat_ids:
         try:
-            telegram_api_request("sendMessage", chat_id, {"text": text})
+            telegram_api_request(
+                "sendMessage",
+                chat_id,
+                {"text": text, "parse_mode": "MarkdownV2"},
+            )
         except Exception as e:
             print(f"Chat ID {chat_id} 전송 실패: {e}")
             succeeded = False
@@ -221,6 +422,9 @@ def parse_notice_details(html, page_url):
 
     return {
         "content": html_content_to_text(content_element, page_url),
+        "content_markdown_blocks": html_content_to_markdown_blocks(
+            content_element, page_url
+        ),
         "attachments": attachments,
         "inline_images": inline_images,
     }
