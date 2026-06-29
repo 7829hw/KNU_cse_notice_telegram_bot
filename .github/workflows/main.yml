@@ -1,8 +1,10 @@
-name: KNU Dormitory Notice Bot
+name: KNU CSE Notice Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # 매시간 정각(0분)에 1번씩 실행 (UTC 기준)
+    # 한국시간(KST, UTC+9) 기준 매일 08:00~20:00에 매시간 실행
+    - cron: '0 23 * * *'   # KST 08:00
+    - cron: '0 0-11 * * *' # KST 09:00~20:00
   workflow_dispatch: # GitHub 웹페이지에서 수동으로 실행할 수 있는 버튼 활성화
 
 jobs:
