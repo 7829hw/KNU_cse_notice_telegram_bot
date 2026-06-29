@@ -3,6 +3,10 @@ from bs4 import BeautifulSoup
 import os
 import sys
 import time
+import re
+import tempfile
+from pathlib import Path
+from urllib.parse import unquote, urljoin, urlparse
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
@@ -10,6 +14,9 @@ from selenium.webdriver.chrome.options import Options
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 LAST_NUM_FILE = "last_num.txt"
 CHAT_IDS_FILE = "chat_ids.txt"
+BOARD_URL = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+TELEGRAM_MESSAGE_LIMIT = 4096
 # =============================================
 
 def update_subscribers():
@@ -39,19 +46,198 @@ def update_subscribers():
         print(f"구독자 업데이트 중 오류 발생: {e}")
         return list(subscribers)
 
+def telegram_api_request(method, chat_id, data=None, files=None):
+    """텔레그램 API를 호출하고 실패 시 예외를 발생시킵니다."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    payload = {"chat_id": chat_id}
+    if data:
+        payload.update(data)
+
+    response = requests.post(url, data=payload, files=files, timeout=60)
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "텔레그램 API 오류"))
+    return result
+
+
+def split_message(text, limit=TELEGRAM_MESSAGE_LIMIT):
+    """텔레그램 글자 수 제한에 맞춰 문단/단어 경계에서 메시지를 나눕니다."""
+    text = text.strip()
+    chunks = []
+
+    while len(text) > limit:
+        split_at = text.rfind("\n", 0, limit + 1)
+        if split_at < limit // 2:
+            word_boundary = text.rfind(" ", 0, limit + 1)
+            split_at = word_boundary if word_boundary >= limit // 2 else limit
+        if split_at <= 0:
+            split_at = limit
+
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+
+    if text:
+        chunks.append(text)
+    return chunks
+
+
+def build_notice_messages(post):
+    """제목, 전체 본문, 원문 링크를 텔레그램 메시지들로 만듭니다."""
+    body = post.get("content", "").strip() or "(본문 내용 없음)"
+    text = f"📢 {post['title']}\n\n{body}\n\n🔗 원문 보기\n{post['link']}"
+    return split_message(text)
+
+
 def send_telegram_message(text, chat_ids):
     """여러 사용자에게 메시지를 전송합니다."""
+    succeeded = True
     for chat_id in chat_ids:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
         try:
-            requests.post(url, data=payload)
+            telegram_api_request("sendMessage", chat_id, {"text": text})
         except Exception as e:
             print(f"Chat ID {chat_id} 전송 실패: {e}")
+            succeeded = False
+    return succeeded
+
+
+def safe_filename(name, default="attachment"):
+    """운영체제에서 사용할 수 없는 문자를 제거한 안전한 파일명을 반환합니다."""
+    name = unquote(name or "").strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    return name[:180] or default
+
+
+def download_file(file_info, directory, referer):
+    """게시판 파일을 임시 폴더에 다운로드합니다."""
+    headers = {"User-Agent": USER_AGENT, "Referer": referer}
+    # 그누보드 다운로드는 상세 페이지에서 발급한 PHP 세션이 없으면
+    # HTTP 200의 오류 HTML을 반환하므로 같은 세션으로 상세 페이지를 먼저 엽니다.
+    session = requests.Session()
+    session.headers.update(headers)
+    page_response = session.get(referer, timeout=30)
+    page_response.raise_for_status()
+    response = session.get(file_info["url"], stream=True, timeout=60)
+    response.raise_for_status()
+
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "text/html" in content_type:
+        response.close()
+        raise RuntimeError("사이트가 첨부파일 대신 오류 페이지를 반환했습니다.")
+
+    filename = safe_filename(file_info.get("name"))
+    path = Path(directory) / filename
+    counter = 1
+    while path.exists():
+        path = Path(directory) / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
+        counter += 1
+
+    with path.open("wb") as output:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            if chunk:
+                output.write(chunk)
+    return path
+
+
+def send_telegram_file(file_info, chat_ids, referer, label="첨부파일"):
+    """파일을 한 번 내려받은 뒤 모든 구독자에게 문서로 전송합니다."""
+    succeeded = True
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = download_file(file_info, directory, referer)
+            for chat_id in chat_ids:
+                try:
+                    with path.open("rb") as document:
+                        telegram_api_request(
+                            "sendDocument",
+                            chat_id,
+                            {"caption": f"📎 {label}: {file_info['name']}"},
+                            {"document": (path.name, document)},
+                        )
+                except Exception as e:
+                    print(f"Chat ID {chat_id} 파일 전송 실패 ({file_info['name']}): {e}")
+                    succeeded = False
+    except Exception as e:
+        print(f"파일 다운로드 실패 ({file_info['name']}): {e}")
+        succeeded = False
+    return succeeded
+
+
+def html_content_to_text(content_element, base_url=""):
+    """게시글 HTML을 읽기 쉬운 일반 텍스트로 변환합니다."""
+    if not content_element:
+        return ""
+
+    content = BeautifulSoup(str(content_element), "html.parser")
+    for unwanted in content.select("script, style"):
+        unwanted.decompose()
+    for link in content.select("a[href]"):
+        href = link.get("href", "").strip()
+        absolute_url = urljoin(base_url, href)
+        if href and not href.startswith(("#", "javascript:")) and absolute_url not in link.get_text():
+            link.append(f" ({absolute_url})")
+    for line_break in content.select("br"):
+        line_break.replace_with("\n")
+    for cell in content.select("td, th"):
+        cell.append("\t")
+    for block in content.select("p, div, li, tr, h1, h2, h3, h4, h5, h6, blockquote"):
+        block.append("\n")
+
+    text = content.get_text()
+    text = text.replace("\xa0", " ")
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    text = "\n".join(lines)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def parse_notice_details(html, page_url):
+    """상세 페이지에서 본문, 첨부파일, 본문 이미지를 추출합니다."""
+    soup = BeautifulSoup(html, "html.parser")
+    content_element = soup.select_one("#bo_v_con")
+    if not content_element:
+        raise ValueError("상세 페이지에서 본문을 찾지 못했습니다.")
+
+    attachments = []
+    for link in soup.select("#bo_v_file a[href]"):
+        url = urljoin(page_url, link.get("href"))
+        name_element = link.select_one("strong")
+        name = name_element.get_text(" ", strip=True) if name_element else link.get_text(" ", strip=True)
+        attachments.append({"name": safe_filename(name), "url": url})
+
+    inline_images = []
+    seen_urls = set()
+    for index, image in enumerate(content_element.select("img"), start=1):
+        source = image.get("data-src") or image.get("src")
+        if not source or source.startswith("data:"):
+            continue
+        url = urljoin(page_url, source)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        name = image.get("alt", "").strip() or Path(urlparse(url).path).name
+        if not Path(name).suffix:
+            name = f"본문_이미지_{index}.jpg"
+        inline_images.append({"name": safe_filename(name, f"본문_이미지_{index}.jpg"), "url": url})
+
+    return {
+        "content": html_content_to_text(content_element, page_url),
+        "attachments": attachments,
+        "inline_images": inline_images,
+    }
+
+
+def get_notice_details(page_url):
+    """공지 상세 페이지를 가져와 본문과 파일 정보를 반환합니다."""
+    response = requests.get(
+        page_url,
+        headers={"User-Agent": USER_AGENT, "Referer": BOARD_URL},
+        timeout=30,
+    )
+    response.raise_for_status()
+    return parse_notice_details(response.text, page_url)
 
 def get_latest_notices():
     """Selenium을 사용하여 자바스크립트 보안을 통과한 후 최신 글을 가져옵니다."""
-    url = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
     latest_posts = []
     
     # Chrome 브라우저를 화면 없이(Headless) 실행하기 위한 설정
@@ -59,13 +245,13 @@ def get_latest_notices():
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    chrome_options.add_argument(f"user-agent={USER_AGENT}")
     
     driver = None
     try:
         # 웹 브라우저 실행
         driver = webdriver.Chrome(options=chrome_options)
-        driver.get(url)
+        driver.get(BOARD_URL)
         
         # 브라우저가 자바스크립트 챌린지를 풀고 실제 페이지를 로딩할 때까지 5초간 대기합니다.
         time.sleep(5)
@@ -87,8 +273,10 @@ def get_latest_notices():
             #     continue
                 
             title_element = row.select_one('.td_subject .bo_tit a')
+            if not title_element:
+                continue
             title = title_element.text.strip()
-            link = title_element['href']
+            link = urljoin(BOARD_URL, title_element['href'])
             
             try:
                 real_post_id = int(link.split('wr_id=')[1].split('&')[0])
@@ -110,7 +298,7 @@ def get_latest_notices():
     return latest_posts
 
 def check_new_notices():
-    """새로운 글 확인 및 알림 로직 (기존과 동일)"""
+    """새 글의 제목, 본문, 본문 이미지, 첨부파일을 구독자에게 전송합니다."""
     if not TELEGRAM_TOKEN:
         print("오류: 환경변수에 TELEGRAM_TOKEN이 설정되지 않았습니다.")
         sys.exit(1)
@@ -140,15 +328,36 @@ def check_new_notices():
             continue
 
         if post['number'] > last_num:
-            message = f"📢 <b>새로운 공지사항이 등록되었습니다!</b>\n\n"
-            message += f"▪️ <b>제목:</b> {post['title']}\n"
-            message += f"▪️ <b>링크:</b> <a href='{post['link']}'>바로가기</a>"
-            
+            try:
+                post.update(get_notice_details(post["link"]))
+            except Exception as e:
+                print(f"{post['number']}번 글 상세 내용 조회 실패: {e}")
+                # 이후 글 번호로 건너뛰면 실패한 공지를 영영 놓칠 수 있으므로 다음 실행에서 재시도합니다.
+                break
+
+            delivered = True
             if chat_ids:
-                send_telegram_message(message, chat_ids)
-                print(f"알림 전송 완료: {post['number']}번 글")
-            
-            new_last_num = max(new_last_num, post['number'])
+                for message in build_notice_messages(post):
+                    delivered = send_telegram_message(message, chat_ids) and delivered
+                for image in post["inline_images"]:
+                    delivered = send_telegram_file(
+                        image, chat_ids, post["link"], label="본문 이미지"
+                    ) and delivered
+                for attachment in post["attachments"]:
+                    delivered = send_telegram_file(
+                        attachment, chat_ids, post["link"]
+                    ) and delivered
+
+                if delivered:
+                    print(f"알림 전송 완료: {post['number']}번 글")
+                else:
+                    print(f"일부 내용 전송 실패: {post['number']}번 글")
+
+            if delivered:
+                new_last_num = max(new_last_num, post['number'])
+            else:
+                # 번호를 갱신하지 않고 다음 실행에서 이 공지부터 다시 전송합니다.
+                break
 
     if new_last_num > last_num or last_num == 0:
         with open(LAST_NUM_FILE, 'w', encoding='utf-8') as f:
