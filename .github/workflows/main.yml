@@ -19,6 +19,13 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Restore last notice number
+      run: |
+        git fetch origin bot-state || true
+        if git show origin/bot-state:last_num.txt > /tmp/last_num.txt 2>/dev/null; then
+          mv /tmp/last_num.txt last_num.txt
+        fi
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -35,11 +42,15 @@ jobs:
         CHAT_ID: ${{ secrets.CHAT_ID }}
       run: python bot.py
 
-    - name: Commit and push tracking files
+    - name: Save last notice number
       run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        git add last_num.txt chat_ids.txt
-        # 변경사항이 있을 때만 commit 및 push를 수행합니다.
-        git commit -m "Update tracking files automatically" || echo "No changes to commit"
-        git push
+        mkdir -p /tmp/bot-state
+        cp last_num.txt /tmp/bot-state/last_num.txt
+        git checkout --orphan bot-state-update
+        git rm -rf . || true
+        cp /tmp/bot-state/last_num.txt last_num.txt
+        git add last_num.txt
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git commit -m "Update bot state"
+        git push --force origin HEAD:bot-state
