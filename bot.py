@@ -5,6 +5,7 @@ import sys
 import time
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 from selenium import webdriver
@@ -151,6 +152,98 @@ def apply_markdown_styles(text, styles):
     return text
 
 
+def get_display_width(text):
+    """고정폭 글꼴에서 한글과 영문이 차지하는 표시 폭을 계산합니다."""
+    width = 0
+    for character in str(text):
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+    return width
+
+
+def pad_display_text(text, width):
+    """한글의 2칸 폭을 고려해 표 셀 오른쪽을 공백으로 채웁니다."""
+    return str(text) + " " * max(0, width - get_display_width(text))
+
+
+def extract_table_matrix(table):
+    """rowspan과 colspan을 펼쳐 HTML 표를 직사각형 텍스트 행렬로 만듭니다."""
+    rows = [
+        row for row in table.find_all("tr")
+        if row.find_parent("table") is table
+    ]
+    matrix = []
+
+    def ensure_cell(row_index, column_index):
+        while len(matrix) <= row_index:
+            matrix.append([])
+        while len(matrix[row_index]) <= column_index:
+            matrix[row_index].append(None)
+
+    for row_index, row in enumerate(rows):
+        ensure_cell(row_index, 0)
+        column_index = 0
+        cells = row.find_all(["th", "td"], recursive=False)
+        for cell in cells:
+            while (
+                column_index < len(matrix[row_index])
+                and matrix[row_index][column_index] is not None
+            ):
+                column_index += 1
+
+            text = re.sub(r"\s+", " ", " ".join(cell.stripped_strings)).strip()
+            try:
+                rowspan = max(1, int(cell.get("rowspan", 1)))
+            except (TypeError, ValueError):
+                rowspan = 1
+            try:
+                colspan = max(1, int(cell.get("colspan", 1)))
+            except (TypeError, ValueError):
+                colspan = 1
+
+            for target_row in range(row_index, row_index + rowspan):
+                for target_column in range(
+                    column_index, column_index + colspan
+                ):
+                    ensure_cell(target_row, target_column)
+                    matrix[target_row][target_column] = text
+            column_index += colspan
+
+    column_count = max((len(row) for row in matrix), default=0)
+    return [
+        [cell or "" for cell in row + [None] * (column_count - len(row))]
+        for row in matrix
+    ]
+
+
+def render_table_markdown(table):
+    """HTML 표를 텔레그램에서 가로 스크롤 가능한 고정폭 표로 만듭니다."""
+    matrix = extract_table_matrix(table)
+    if not matrix:
+        return ""
+
+    column_widths = [
+        max(get_display_width(row[column]) for row in matrix)
+        for column in range(len(matrix[0]))
+    ]
+
+    lines = []
+    for row_index, row in enumerate(matrix):
+        lines.append(
+            " | ".join(
+                pad_display_text(cell, column_widths[column])
+                for column, cell in enumerate(row)
+            )
+        )
+        if row_index == 0 and len(matrix) > 1:
+            lines.append("-+-".join("-" * width for width in column_widths))
+
+    table_text = "\n".join(lines)
+    table_text = table_text.replace("\\", "\\\\").replace("`", "\\`")
+    return f"```\n{table_text}\n```\n\n"
+
+
 def render_telegram_markdown(node, base_url="", active_styles=frozenset()):
     """게시글 HTML 노드를 Telegram MarkdownV2 문자열로 변환합니다."""
     if isinstance(node, NavigableString):
@@ -172,6 +265,8 @@ def render_telegram_markdown(node, base_url="", active_styles=frozenset()):
     if name == "code":
         code = node.get_text().replace("\\", "\\\\").replace("`", "\\`")
         return f"`{code}`"
+    if name == "table":
+        return render_table_markdown(node)
 
     if name == "tr":
         cells = [

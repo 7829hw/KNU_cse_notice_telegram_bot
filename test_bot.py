@@ -5,6 +5,8 @@ from bs4 import BeautifulSoup
 from bot import (
     TELEGRAM_MESSAGE_LIMIT,
     build_notice_messages,
+    extract_table_matrix,
+    get_display_width,
     html_content_to_markdown_blocks,
     parse_notice_details,
     safe_filename,
@@ -39,7 +41,7 @@ class NoticeBotTest(unittest.TestCase):
         self.assertIn(r"_두 번째 문단_", markdown)
         self.assertIn(r"[설문 참여](https://cse.knu.ac.kr/survey)", markdown)
         self.assertIn("• 첫 항목", markdown)
-        self.assertIn("구분 │ 내용", markdown)
+        self.assertIn("```\n구분 | 내용", markdown)
         self.assertEqual(details["attachments"][0]["name"], "신청서.hwp")
         self.assertEqual(
             details["inline_images"][0]["url"],
@@ -80,6 +82,53 @@ class NoticeBotTest(unittest.TestCase):
                 r"*필수\!* 신청기간: 6\.29\~6\.30",
                 r"*굵게*",
                 r"__연속밑줄__",
+            ],
+        )
+
+    def test_table_cell_paragraphs_stay_in_one_row(self):
+        html = """
+        <div id="bo_v_con">
+          <table>
+            <tr>
+              <td><p>구분</p></td>
+              <td><p>졸업기준</p><p>학점</p></td>
+              <td><p>총이수</p><p>학점</p></td>
+            </tr>
+            <tr><td>1</td><td>140</td><td>150</td></tr>
+          </table>
+        </div>
+        """
+        content = BeautifulSoup(html, "html.parser").select_one("#bo_v_con")
+
+        blocks = html_content_to_markdown_blocks(content)
+        table = next(block for block in blocks if block.startswith("```"))
+        lines = table.splitlines()
+
+        self.assertIn("구분 | 졸업기준 학점 | 총이수 학점", lines[1])
+        self.assertIn("1    | 140", lines[3])
+        header_cells = lines[1].split(" | ")
+        data_cells = lines[3].split(" | ")
+        self.assertEqual(
+            [get_display_width(cell) for cell in header_cells[:-1]],
+            [get_display_width(cell) for cell in data_cells[:-1]],
+        )
+
+    def test_table_rowspan_and_colspan_are_expanded(self):
+        html = """
+        <table>
+          <tr><th rowspan="2">구분</th><th colspan="2">점수</th></tr>
+          <tr><th>중간</th><th>기말</th></tr>
+          <tr><td>A</td><td>90</td><td>95</td></tr>
+        </table>
+        """
+        table = BeautifulSoup(html, "html.parser").select_one("table")
+
+        self.assertEqual(
+            extract_table_matrix(table),
+            [
+                ["구분", "점수", "점수"],
+                ["구분", "중간", "기말"],
+                ["A", "90", "95"],
             ],
         )
 
