@@ -1,5 +1,6 @@
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
+import json
 import os
 import sys
 import time
@@ -15,6 +16,7 @@ from selenium.webdriver.chrome.options import Options
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 LAST_NUM_FILE = "last_num.txt"
 CHAT_IDS_FILE = "chat_ids.txt"
+PENDING_MEDIA_FILE = "pending_media.json"
 BOARD_URL = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 TELEGRAM_MESSAGE_LIMIT = 4096
@@ -47,6 +49,36 @@ def update_subscribers():
     except Exception as e:
         print(f"구독자 업데이트 중 오류 발생: {e}")
         return list(subscribers)
+
+
+def load_pending_media():
+    """이전 실행에서 전송하지 못한 이미지·첨부파일 대기열을 읽습니다."""
+    if not os.path.exists(PENDING_MEDIA_FILE):
+        return []
+    try:
+        with open(PENDING_MEDIA_FILE, "r", encoding="utf-8") as file:
+            pending_media = json.load(file)
+        return pending_media if isinstance(pending_media, list) else []
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"미디어 대기열을 읽지 못했습니다: {error}")
+        return []
+
+
+def save_pending_media(pending_media):
+    """전송에 실패한 이미지·첨부파일만 다음 실행을 위해 보관합니다."""
+    with open(PENDING_MEDIA_FILE, "w", encoding="utf-8") as file:
+        json.dump(pending_media, file, ensure_ascii=False, indent=2)
+
+
+def enqueue_pending_media(pending_media, file_info, referer, label):
+    """같은 미디어를 한 번만 대기열에 추가합니다."""
+    pending_item = {
+        "file_info": file_info,
+        "referer": referer,
+        "label": label,
+    }
+    if pending_item not in pending_media:
+        pending_media.append(pending_item)
 
 def telegram_api_request(method, chat_id, data=None, files=None):
     """텔레그램 API를 호출하고 실패 시 예외를 발생시킵니다."""
@@ -413,7 +445,8 @@ def download_file(file_info, directory, referer):
     session.headers.update(headers)
     page_response = session.get(referer, timeout=30)
     page_response.raise_for_status()
-    response = session.get(file_info["url"], stream=True, timeout=60)
+    # 외부 이미지 서버가 응답하지 않아도 다음 공지 알림까지 장시간 지연되지 않게 합니다.
+    response = session.get(file_info["url"], stream=True, timeout=(10, 60))
     response.raise_for_status()
 
     content_type = response.headers.get("Content-Type", "").lower()
@@ -457,6 +490,23 @@ def send_telegram_file(file_info, chat_ids, referer, label="첨부파일"):
         print(f"파일 다운로드 실패 ({file_info['name']}): {e}")
         succeeded = False
     return succeeded
+
+
+def retry_pending_media(pending_media, chat_ids):
+    """본문을 다시 보내지 않고, 이전에 실패한 미디어만 재전송합니다."""
+    remaining_media = []
+    for pending_item in pending_media:
+        file_info = pending_item.get("file_info", {})
+        referer = pending_item.get("referer", "")
+        label = pending_item.get("label", "첨부파일")
+        if not file_info.get("url") or not file_info.get("name"):
+            print("잘못된 미디어 대기열 항목을 건너뜁니다.")
+            continue
+        if send_telegram_file(file_info, chat_ids, referer, label):
+            print(f"대기 중 미디어 전송 완료: {file_info['name']}")
+        else:
+            remaining_media.append(pending_item)
+    return remaining_media
 
 
 def html_content_to_text(content_element, base_url=""):
@@ -606,6 +656,10 @@ def check_new_notices():
     if not chat_ids:
         print("등록된 구독자가 없습니다.")
 
+    pending_media = load_pending_media()
+    if chat_ids and pending_media:
+        pending_media = retry_pending_media(pending_media, chat_ids)
+
     last_num = 0
     if os.path.exists(LAST_NUM_FILE):
         with open(LAST_NUM_FILE, 'r', encoding='utf-8') as f:
@@ -634,28 +688,34 @@ def check_new_notices():
                 # 이후 글 번호로 건너뛰면 실패한 공지를 영영 놓칠 수 있으므로 다음 실행에서 재시도합니다.
                 break
 
-            delivered = True
+            message_delivered = True
             if chat_ids:
                 for message in build_notice_messages(post):
-                    delivered = send_telegram_message(message, chat_ids) and delivered
+                    message_delivered = (
+                        send_telegram_message(message, chat_ids) and message_delivered
+                    )
                 for image in post["inline_images"]:
-                    delivered = send_telegram_file(
+                    if not send_telegram_file(
                         image, chat_ids, post["link"], label="본문 이미지"
-                    ) and delivered
+                    ):
+                        enqueue_pending_media(
+                            pending_media, image, post["link"], "본문 이미지"
+                        )
                 for attachment in post["attachments"]:
-                    delivered = send_telegram_file(
-                        attachment, chat_ids, post["link"]
-                    ) and delivered
+                    if not send_telegram_file(attachment, chat_ids, post["link"]):
+                        enqueue_pending_media(
+                            pending_media, attachment, post["link"], "첨부파일"
+                        )
 
-                if delivered:
+                if message_delivered:
                     print(f"알림 전송 완료: {post['number']}번 글")
                 else:
-                    print(f"일부 내용 전송 실패: {post['number']}번 글")
+                    print(f"본문 알림 전송 실패: {post['number']}번 글")
 
-            if delivered:
+            if message_delivered:
                 new_last_num = max(new_last_num, post['number'])
             else:
-                # 번호를 갱신하지 않고 다음 실행에서 이 공지부터 다시 전송합니다.
+                # 본문 알림이 실패한 경우에만 다음 실행에서 공지 전체를 다시 전송합니다.
                 break
 
     if new_last_num > last_num or last_num == 0:
@@ -664,6 +724,8 @@ def check_new_notices():
         print(f"마지막 글 번호 업데이트 완료: {new_last_num}")
     else:
         print(f"새로운 공지사항이 없습니다. (마지막 글 번호: {last_num})")
+
+    save_pending_media(pending_media)
 
 if __name__ == "__main__":
     print("공지사항 크롤링 및 구독자 알림을 시작합니다...")

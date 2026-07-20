@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from bot import (
     TELEGRAM_MESSAGE_LIMIT,
     build_notice_messages,
+    enqueue_pending_media,
     extract_table_matrix,
     get_display_width,
     html_content_to_markdown_blocks,
@@ -134,6 +135,23 @@ class NoticeBotTest(unittest.TestCase):
 
     def test_safe_filename(self):
         self.assertEqual(safe_filename('신청서:최종?.hwp'), "신청서_최종_.hwp")
+
+    def test_failed_media_is_queued_once_for_retry(self):
+        pending_media = []
+        image = {
+            "name": "안내 이미지.png",
+            "url": "https://example.com/notice.png",
+        }
+
+        enqueue_pending_media(
+            pending_media, image, "https://example.com/notice", "본문 이미지"
+        )
+        enqueue_pending_media(
+            pending_media, image, "https://example.com/notice", "본문 이미지"
+        )
+
+        self.assertEqual(len(pending_media), 1)
+        self.assertEqual(pending_media[0]["file_info"], image)
 
 
 if __name__ == "__main__":

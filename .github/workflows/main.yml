@@ -21,9 +21,14 @@ jobs:
 
     - name: Restore last notice number
       run: |
-        git fetch origin bot-state || true
-        if git show origin/bot-state:last_num.txt > /tmp/last_num.txt 2>/dev/null; then
+        # 단일 브랜치 fetch는 기본적으로 FETCH_HEAD만 갱신하므로,
+        # 다음 실행에서도 읽을 수 있는 원격 추적 참조를 명시적으로 갱신합니다.
+        git fetch origin bot-state:refs/remotes/origin/bot-state || true
+        if git show refs/remotes/origin/bot-state:last_num.txt > /tmp/last_num.txt 2>/dev/null; then
           mv /tmp/last_num.txt last_num.txt
+        fi
+        if git show refs/remotes/origin/bot-state:pending_media.json > /tmp/pending_media.json 2>/dev/null; then
+          mv /tmp/pending_media.json pending_media.json
         fi
 
     - name: Set up Python
@@ -46,10 +51,13 @@ jobs:
       run: |
         mkdir -p /tmp/bot-state
         cp last_num.txt /tmp/bot-state/last_num.txt
+        cp pending_media.json /tmp/bot-state/pending_media.json
         git checkout --orphan bot-state-update
         git rm -rf . || true
         cp /tmp/bot-state/last_num.txt last_num.txt
+        cp /tmp/bot-state/pending_media.json pending_media.json
         git add last_num.txt
+        git add pending_media.json
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git commit -m "Update bot state"
