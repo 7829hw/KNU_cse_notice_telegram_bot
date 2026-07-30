@@ -3,21 +3,46 @@ from bs4 import BeautifulSoup, NavigableString, Tag
 import json
 import os
 import sys
-import time
 import re
 import tempfile
 import unicodedata
 from pathlib import Path
-from urllib.parse import unquote, urljoin, urlparse
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 # ================= 설정 부분 =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 LAST_NUM_FILE = "last_num.txt"
 CHAT_IDS_FILE = "chat_ids.txt"
 PENDING_MEDIA_FILE = "pending_media.json"
-BOARD_URL = "https://cse.knu.ac.kr/bbs/board.php?bo_table=sub5_1"
+BOARDS = (
+    {
+        "key": "undergraduate",
+        "name": "학부",
+        "url": (
+            "https://computer.knu.ac.kr/bbs/board.php"
+            "?bo_table=sub6_1_a&lang=kor"
+        ),
+        "uses_legacy_cursor": True,
+    },
+    {
+        "key": "graduate",
+        "name": "대학원",
+        "url": (
+            "https://computer.knu.ac.kr/bbs/board.php"
+            "?bo_table=sub6_1_b&lang=kor"
+        ),
+        "uses_legacy_cursor": True,
+    },
+    {
+        "key": "undergraduate_recruitment",
+        "name": "학부인재모집",
+        "url": (
+            "https://computer.knu.ac.kr/bbs/board.php"
+            "?bo_table=sub6_3_a&lang=kor"
+        ),
+        "uses_legacy_cursor": False,
+    },
+)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_MARKDOWN_BLOCK_LIMIT = 3500
@@ -394,8 +419,12 @@ def build_notice_messages(post):
         body = post.get("content", "").strip() or "(본문 내용 없음)"
         body_blocks = plain_text_to_markdown_blocks(body)
 
+    title = post["title"]
+    if post.get("board_name"):
+        title = f"[{post['board_name']}] {title}"
+
     blocks = [
-        f"📢 *{escape_markdown_v2(post['title'])}*",
+        f"📢 *{escape_markdown_v2(title)}*",
         *body_blocks,
         f"🔗 [원문 보기]({escape_markdown_url(post['link'])})",
     ]
@@ -536,16 +565,92 @@ def html_content_to_text(content_element, base_url=""):
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
+def load_last_notice_state(path=None):
+    """게시판별 마지막 글 번호와 기존 단일 숫자 형식 여부를 읽습니다."""
+    path = path or LAST_NUM_FILE
+    last_numbers = {board["key"]: 0 for board in BOARDS}
+    if not os.path.exists(path):
+        return last_numbers, False
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            content = file.read().strip()
+    except OSError as error:
+        print(f"마지막 글 번호를 읽지 못했습니다: {error}")
+        return last_numbers, False
+
+    if content.isdigit():
+        legacy_last_number = int(content)
+        return (
+            {
+                board["key"]: (
+                    legacy_last_number
+                    if board.get("uses_legacy_cursor")
+                    else 0
+                )
+                for board in BOARDS
+            },
+            True,
+        )
+
+    try:
+        saved_numbers = json.loads(content)
+    except json.JSONDecodeError as error:
+        print(f"마지막 글 번호 파일 형식이 올바르지 않습니다: {error}")
+        return last_numbers, False
+
+    if not isinstance(saved_numbers, dict):
+        print("마지막 글 번호 파일이 게시판별 객체 형식이 아닙니다.")
+        return last_numbers, False
+
+    for board in BOARDS:
+        value = saved_numbers.get(board["key"], 0)
+        try:
+            last_numbers[board["key"]] = max(0, int(value))
+        except (TypeError, ValueError):
+            print(
+                f"{board['name']} 마지막 글 번호가 올바르지 않아 0으로 초기화합니다."
+            )
+    return last_numbers, False
+
+
+def load_last_notice_numbers(path=None):
+    """게시판별 마지막 글 번호를 읽고 기존 단일 숫자 형식도 이관합니다."""
+    last_numbers, _ = load_last_notice_state(path)
+    return last_numbers
+
+
+def save_last_notice_numbers(last_numbers, path=None):
+    """게시판별 마지막 글 번호를 JSON 형식으로 저장합니다."""
+    path = path or LAST_NUM_FILE
+    saved_numbers = {
+        board["key"]: max(0, int(last_numbers.get(board["key"], 0)))
+        for board in BOARDS
+    }
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(saved_numbers, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+
+
 def parse_notice_details(html, page_url):
     """상세 페이지에서 본문, 첨부파일, 본문 이미지를 추출합니다."""
     soup = BeautifulSoup(html, "html.parser")
-    content_element = soup.select_one("#bo_v_con")
+    content_element = soup.select_one(
+        "#bo_v_con, #bo_v_atc .view_content, .bo_v_con"
+    )
     if not content_element:
         raise ValueError("상세 페이지에서 본문을 찾지 못했습니다.")
 
     attachments = []
-    for link in soup.select("#bo_v_file a[href]"):
+    seen_attachment_urls = set()
+    for link in soup.select(
+        "#bo_v_file a.view_file_download[href], "
+        "#bo_v_file a[href*='download.php']"
+    ):
         url = urljoin(page_url, link.get("href"))
+        if url in seen_attachment_urls:
+            continue
+        seen_attachment_urls.add(url)
         name_element = link.select_one("strong")
         name = name_element.get_text(" ", strip=True) if name_element else link.get_text(" ", strip=True)
         attachments.append({"name": safe_filename(name), "url": url})
@@ -575,76 +680,85 @@ def parse_notice_details(html, page_url):
     }
 
 
-def get_notice_details(page_url):
+def get_notice_details(page_url, board_url=None):
     """공지 상세 페이지를 가져와 본문과 파일 정보를 반환합니다."""
     response = requests.get(
         page_url,
-        headers={"User-Agent": USER_AGENT, "Referer": BOARD_URL},
+        headers={"User-Agent": USER_AGENT, "Referer": board_url or page_url},
         timeout=30,
     )
     response.raise_for_status()
     return parse_notice_details(response.text, page_url)
 
-def get_latest_notices():
-    """Selenium을 사용하여 자바스크립트 보안을 통과한 후 최신 글을 가져옵니다."""
+
+def parse_notice_list(html, board):
+    """새 홈페이지의 공지 목록 HTML에서 글 번호, 제목, 링크를 추출합니다."""
+    soup = BeautifulSoup(html, "html.parser")
+    notice_table = soup.select_one(
+        "#bo_list #fboardlist .basic_tbl_head table, "
+        "#bo_list .basic_tbl_head table"
+    )
+    if not notice_table:
+        return []
+
     latest_posts = []
-    
-    # Chrome 브라우저를 화면 없이(Headless) 실행하기 위한 설정
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument(f"user-agent={USER_AGENT}")
-    
-    driver = None
-    try:
-        # 웹 브라우저 실행
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.get(BOARD_URL)
-        
-        # 브라우저가 자바스크립트 챌린지를 풀고 실제 페이지를 로딩할 때까지 5초간 대기합니다.
-        time.sleep(5)
-        
-        # 렌더링이 끝난 페이지의 HTML 코드를 가져옵니다.
-        html = driver.page_source
-        soup = BeautifulSoup(html, 'html.parser')
-        rows = soup.select('tbody tr')
-        
-        if not rows:
-            print("❗ 대기 후에도 게시글을 찾지 못했습니다. 방화벽이 더 강력하게 차단했을 수 있습니다.")
-            
-        for row in rows:
-            num_element = row.select_one('.td_num2')
-            if not num_element:
-                continue
-            num_text = num_element.text.strip()
-            # if num_text == "공지":
-            #     continue
-                
-            title_element = row.select_one('.td_subject .bo_tit a')
-            if not title_element:
-                continue
-            title = title_element.text.strip()
-            link = urljoin(BOARD_URL, title_element['href'])
-            
-            try:
-                real_post_id = int(link.split('wr_id=')[1].split('&')[0])
-            except ValueError:
-                continue
-            
-            latest_posts.append({
-                'number': real_post_id,
-                'title': title,
-                'link': link
-            })
-    except Exception as e:
-        print(f"크롤링 중 오류 발생: {e}")
-    finally:
-        # 작업이 끝나면 반드시 브라우저를 종료해야 메모리 누수가 발생하지 않습니다.
-        if driver:
-            driver.quit()
-            
+    seen_post_ids = set()
+    for row in notice_table.select("tbody tr"):
+        if not row.select_one(".td_num2"):
+            continue
+
+        title_element = row.select_one(".td_subject .bo_tit a[href]")
+        if not title_element:
+            continue
+
+        link = urljoin(board["url"], title_element.get("href", ""))
+        post_id_values = parse_qs(urlparse(link).query).get("wr_id")
+        if not post_id_values:
+            continue
+        try:
+            real_post_id = int(post_id_values[0])
+        except (TypeError, ValueError):
+            continue
+        if real_post_id in seen_post_ids:
+            continue
+        seen_post_ids.add(real_post_id)
+
+        latest_posts.append({
+            "number": real_post_id,
+            "title": title_element.get_text(" ", strip=True),
+            "link": link,
+            "board_key": board["key"],
+            "board_name": board["name"],
+            "board_url": board["url"],
+        })
     return latest_posts
+
+
+def get_latest_notices():
+    """설정된 각 게시판에서 최신 글 목록을 가져옵니다."""
+    latest_posts_by_board = {}
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    try:
+        for board in BOARDS:
+            try:
+                response = session.get(board["url"], timeout=30)
+                response.raise_for_status()
+                posts = parse_notice_list(response.text, board)
+                if not posts:
+                    print(
+                        f"❗ {board['name']} 게시판에서 게시글을 찾지 못했습니다."
+                    )
+                    continue
+                latest_posts_by_board[board["key"]] = posts
+            except Exception as error:
+                print(f"{board['name']} 게시판 크롤링 중 오류 발생: {error}")
+    finally:
+        session.close()
+
+    return latest_posts_by_board
+
 
 def check_new_notices():
     """새 글의 제목, 본문, 본문 이미지, 첨부파일을 구독자에게 전송합니다."""
@@ -660,31 +774,73 @@ def check_new_notices():
     if chat_ids and pending_media:
         pending_media = retry_pending_media(pending_media, chat_ids)
 
-    last_num = 0
-    if os.path.exists(LAST_NUM_FILE):
-        with open(LAST_NUM_FILE, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            if content.isdigit():
-                last_num = int(content)
-
-    posts = get_latest_notices()
-    if not posts:
+    last_numbers, legacy_state = load_last_notice_state()
+    posts_by_board = get_latest_notices()
+    if not posts_by_board:
         print("게시글을 불러오지 못했습니다.")
+        save_pending_media(pending_media)
         return
 
-    posts.reverse()
-    new_last_num = last_num
+    if legacy_state:
+        legacy_board_keys = {
+            board["key"]
+            for board in BOARDS
+            if board.get("uses_legacy_cursor")
+        }
+        missing_board_keys = legacy_board_keys - posts_by_board.keys()
+        if missing_board_keys:
+            missing_board_names = ", ".join(
+                board["name"]
+                for board in BOARDS
+                if board["key"] in missing_board_keys
+            )
+            print(
+                "기존 상태 이관을 위해 필요한 게시판을 불러오지 못했습니다: "
+                f"{missing_board_names}"
+            )
+            save_pending_media(pending_media)
+            return
 
-    for post in posts:
-        if last_num == 0:
-            new_last_num = max(new_last_num, post['number'])
+    for board in BOARDS:
+        board_key = board["key"]
+        if board_key not in posts_by_board:
             continue
 
-        if post['number'] > last_num:
+        posts = list(reversed(posts_by_board[board_key]))
+        last_num = last_numbers.get(board_key, 0)
+        current_max_number = max(
+            (post["number"] for post in posts),
+            default=0,
+        )
+        if (
+            legacy_state
+            and board.get("uses_legacy_cursor")
+            and current_max_number < last_num
+        ):
+            last_num = current_max_number
+            print(
+                f"{board['name']} 마지막 글 번호를 분리된 게시판 기준 "
+                f"{last_num}(으)로 조정합니다."
+            )
+        new_last_num = last_num
+
+        for post in posts:
+            if last_num == 0:
+                new_last_num = max(new_last_num, post["number"])
+                continue
+
+            if post["number"] <= last_num:
+                continue
+
             try:
-                post.update(get_notice_details(post["link"]))
+                post.update(
+                    get_notice_details(post["link"], post["board_url"])
+                )
             except Exception as e:
-                print(f"{post['number']}번 글 상세 내용 조회 실패: {e}")
+                print(
+                    f"{board['name']} {post['number']}번 글 "
+                    f"상세 내용 조회 실패: {e}"
+                )
                 # 이후 글 번호로 건너뛰면 실패한 공지를 영영 놓칠 수 있으므로 다음 실행에서 재시도합니다.
                 break
 
@@ -708,23 +864,35 @@ def check_new_notices():
                         )
 
                 if message_delivered:
-                    print(f"알림 전송 완료: {post['number']}번 글")
+                    print(
+                        f"알림 전송 완료: "
+                        f"{board['name']} {post['number']}번 글"
+                    )
                 else:
-                    print(f"본문 알림 전송 실패: {post['number']}번 글")
+                    print(
+                        f"본문 알림 전송 실패: "
+                        f"{board['name']} {post['number']}번 글"
+                    )
 
             if message_delivered:
-                new_last_num = max(new_last_num, post['number'])
+                new_last_num = max(new_last_num, post["number"])
             else:
                 # 본문 알림이 실패한 경우에만 다음 실행에서 공지 전체를 다시 전송합니다.
                 break
 
-    if new_last_num > last_num or last_num == 0:
-        with open(LAST_NUM_FILE, 'w', encoding='utf-8') as f:
-            f.write(str(new_last_num))
-        print(f"마지막 글 번호 업데이트 완료: {new_last_num}")
-    else:
-        print(f"새로운 공지사항이 없습니다. (마지막 글 번호: {last_num})")
+        last_numbers[board_key] = new_last_num
+        if new_last_num > last_num or last_num == 0:
+            print(
+                f"{board['name']} 마지막 글 번호 업데이트 완료: "
+                f"{new_last_num}"
+            )
+        else:
+            print(
+                f"{board['name']} 새로운 공지사항이 없습니다. "
+                f"(마지막 글 번호: {last_num})"
+            )
 
+    save_last_notice_numbers(last_numbers)
     save_pending_media(pending_media)
 
 if __name__ == "__main__":
