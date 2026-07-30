@@ -18,6 +18,7 @@ from bot import (
     load_last_notice_numbers,
     parse_notice_list,
     parse_notice_details,
+    refresh_download_url,
     safe_filename,
     save_last_notice_numbers,
 )
@@ -148,6 +149,53 @@ class NoticeBotTest(unittest.TestCase):
         self.assertEqual(
             request.call_args.kwargs["headers"]["Referer"],
             board["url"],
+        )
+
+    def test_refresh_download_url_uses_current_session_nonce(self):
+        referer = (
+            "https://computer.knu.ac.kr/bbs/board.php"
+            "?bo_table=sub6_1_a&wr_id=29355"
+        )
+        file_info = {
+            "name": "졸업예정자.pdf",
+            "url": (
+                "https://computer.knu.ac.kr/bbs/download.php"
+                "?bo_table=sub6_1_a&wr_id=29355&no=0&nonce=old"
+            ),
+        }
+        page_html = """
+        <section id="bo_v_file">
+          <a class="view_file_download"
+             href="/bbs/download.php?bo_table=sub6_1_a&amp;wr_id=29355&amp;no=0&amp;nonce=fresh">
+            <strong>졸업예정자.pdf</strong>
+          </a>
+        </section>
+        """
+
+        refreshed_url = refresh_download_url(
+            file_info,
+            page_html,
+            referer,
+        )
+
+        self.assertEqual(
+            refreshed_url,
+            (
+                "https://computer.knu.ac.kr/bbs/download.php"
+                "?bo_table=sub6_1_a&wr_id=29355&no=0&nonce=fresh"
+            ),
+        )
+
+    def test_refresh_download_url_leaves_inline_image_unchanged(self):
+        image_url = "https://example.com/image.png"
+
+        self.assertEqual(
+            refresh_download_url(
+                {"name": "image.png", "url": image_url},
+                '<div id="bo_v_file"></div>',
+                BOARDS[0]["url"],
+            ),
+            image_url,
         )
 
     def test_legacy_last_number_migrates_without_blocking_new_board(self):

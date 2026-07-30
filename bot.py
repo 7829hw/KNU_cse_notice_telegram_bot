@@ -465,35 +465,76 @@ def safe_filename(name, default="attachment"):
     return name[:180] or default
 
 
+def refresh_download_url(file_info, page_html, referer):
+    """현재 세션의 상세 페이지에서 같은 첨부파일의 새 nonce URL을 찾습니다."""
+    original_url = file_info["url"]
+    original_parsed = urlparse(original_url)
+    if not original_parsed.path.endswith("/bbs/download.php"):
+        return original_url
+
+    original_query = parse_qs(original_parsed.query)
+    identity_keys = ("bo_table", "wr_id", "no")
+    if not all(original_query.get(key) for key in identity_keys):
+        return original_url
+
+    soup = BeautifulSoup(page_html, "html.parser")
+    for link in soup.select("#bo_v_file a[href]"):
+        candidate_url = urljoin(referer, link.get("href"))
+        candidate_parsed = urlparse(candidate_url)
+        if not candidate_parsed.path.endswith("/bbs/download.php"):
+            continue
+        candidate_query = parse_qs(candidate_parsed.query)
+        if all(
+            original_query.get(key) == candidate_query.get(key)
+            for key in identity_keys
+        ):
+            return candidate_url
+
+    return original_url
+
+
 def download_file(file_info, directory, referer):
     """게시판 파일을 임시 폴더에 다운로드합니다."""
     headers = {"User-Agent": USER_AGENT, "Referer": referer}
     # 그누보드 다운로드는 상세 페이지에서 발급한 PHP 세션이 없으면
     # HTTP 200의 오류 HTML을 반환하므로 같은 세션으로 상세 페이지를 먼저 엽니다.
-    session = requests.Session()
-    session.headers.update(headers)
-    page_response = session.get(referer, timeout=30)
-    page_response.raise_for_status()
-    # 외부 이미지 서버가 응답하지 않아도 다음 공지 알림까지 장시간 지연되지 않게 합니다.
-    response = session.get(file_info["url"], stream=True, timeout=(10, 60))
-    response.raise_for_status()
+    with requests.Session() as session:
+        session.headers.update(headers)
+        with session.get(referer, timeout=30) as page_response:
+            page_response.raise_for_status()
+            download_url = refresh_download_url(
+                file_info,
+                page_response.text,
+                referer,
+            )
 
-    content_type = response.headers.get("Content-Type", "").lower()
-    if "text/html" in content_type:
-        response.close()
-        raise RuntimeError("사이트가 첨부파일 대신 오류 페이지를 반환했습니다.")
+        # 외부 이미지 서버가 응답하지 않아도 다음 공지 알림까지 장시간 지연되지 않게 합니다.
+        with session.get(
+            download_url,
+            stream=True,
+            timeout=(10, 60),
+        ) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if "text/html" in content_type:
+                raise RuntimeError(
+                    "사이트가 첨부파일 대신 오류 페이지를 반환했습니다."
+                )
 
-    filename = safe_filename(file_info.get("name"))
-    path = Path(directory) / filename
-    counter = 1
-    while path.exists():
-        path = Path(directory) / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
-        counter += 1
+            filename = safe_filename(file_info.get("name"))
+            path = Path(directory) / filename
+            counter = 1
+            while path.exists():
+                path = (
+                    Path(directory)
+                    / f"{Path(filename).stem}_{counter}{Path(filename).suffix}"
+                )
+                counter += 1
 
-    with path.open("wb") as output:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                output.write(chunk)
+            with path.open("wb") as output:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        output.write(chunk)
     return path
 
 
