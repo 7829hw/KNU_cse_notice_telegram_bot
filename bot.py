@@ -16,7 +16,13 @@ from telegram.ext import (
 
 import config
 import crawler
-from config import BOARDS, OPTION_LABELS, SUBSCRIPTION_KEYS
+from config import (
+    BOARD_KEYS,
+    BOARDS,
+    CONTENT_OPTION_KEYS,
+    OPTION_LABELS,
+    SUBSCRIPTION_KEYS,
+)
 from database import Database
 from notifier import Notifier
 
@@ -56,10 +62,11 @@ def format_settings_text(settings):
         f"{mark(board['key'])} {OPTION_LABELS[board['key']]}" for board in BOARDS
     ]
     lines.append("")
-    lines += [
-        f"{mark(key)} {OPTION_LABELS[key]}"
-        for key in ("include_content", "include_attachments")
-    ]
+    lines.append(
+        " | ".join(
+            f"{mark(key)} {OPTION_LABELS[key]}" for key in CONTENT_OPTION_KEYS
+        )
+    )
     lines.append("")
     if settings["active"]:
         lines.append("아래 버튼을 눌러 항목을 켜고 끌 수 있습니다.")
@@ -70,15 +77,14 @@ def format_settings_text(settings):
 
 def build_settings_keyboard(settings):
     """항목별 토글과 전체 켜기/끄기 버튼을 만듭니다."""
-    rows = [
-        [
-            InlineKeyboardButton(
-                f"{'✅' if settings[key] else '⬜'} {OPTION_LABELS[key]}",
-                callback_data=f"toggle:{key}",
-            )
-        ]
-        for key in SUBSCRIPTION_KEYS
-    ]
+    def button(key):
+        return InlineKeyboardButton(
+            f"{'✅' if settings[key] else '⬜'} {OPTION_LABELS[key]}",
+            callback_data=f"toggle:{key}",
+        )
+
+    rows = [[button(key)] for key in BOARD_KEYS]
+    rows.append([button(key) for key in CONTENT_OPTION_KEYS])
     rows.append([
         InlineKeyboardButton("✅ 전체 활성화", callback_data="enable:all"),
         InlineKeyboardButton("🔕 전체 비활성화", callback_data="disable:all"),
