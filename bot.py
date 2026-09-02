@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import datetime
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     AIORateLimiter,
@@ -33,12 +33,15 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("knu-notice-bot")
 
-HELP_TEXT = (
-    "🤖 경북대학교 컴퓨터학부 공지 알림 봇\n\n"
-    "/start - 알림 받기 시작 (기존 설정은 그대로 유지)\n"
-    "/settings - 게시판·본문·첨부파일 알림 설정 변경\n"
-    "/stop - 알림 일시 중지 (설정은 보관)\n"
-    "/help - 이 도움말 보기"
+BOT_COMMANDS = (
+    BotCommand("start", "알림 받기 시작 (기존 설정은 그대로 유지)"),
+    BotCommand("settings", "게시판·본문·첨부파일 알림 설정 변경"),
+    BotCommand("stop", "알림 일시 중지 (설정은 보관)"),
+    BotCommand("help", "이 도움말 보기"),
+)
+
+HELP_TEXT = "🤖 경북대학교 컴퓨터학부 공지 알림 봇\n\n" + "\n".join(
+    f"/{command.command} - {command.description}" for command in BOT_COMMANDS
 )
 
 # 같은 크롤링 작업이 겹쳐 실행되지 않도록 막습니다.
@@ -295,6 +298,11 @@ async def check_notices_job(context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------
 # 애플리케이션
 # ----------------------------------------------------------------------
+async def on_startup(application):
+    """텔레그램 클라이언트의 '/' 자동완성에 명령어 설명을 등록합니다."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+
+
 async def on_shutdown(application):
     """종료 시 SQLite 연결을 정상적으로 닫습니다."""
     database = application.bot_data.get("database")
@@ -309,6 +317,7 @@ def build_application(database):
         .token(config.TELEGRAM_TOKEN)
         # 구독자가 늘어도 텔레그램 전송 제한에 걸리지 않도록 속도를 조절합니다.
         .rate_limiter(AIORateLimiter())
+        .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
     )
