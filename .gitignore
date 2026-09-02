@@ -1,2 +1,17 @@
 __pycache__/
 *.py[cod]
+.venv/
+venv/
+
+# 런타임 비밀값과 상태
+.env
+data/*
+!data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+
+# GitHub Actions 시절의 상태 파일
+chat_ids.txt
+last_num.txt
+pending_media.json
