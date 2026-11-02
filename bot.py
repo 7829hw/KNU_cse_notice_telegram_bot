@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 from telegram.ext import (
     AIORateLimiter,
     ApplicationBuilder,
@@ -303,6 +303,17 @@ async def on_startup(application):
     await application.bot.set_my_commands(BOT_COMMANDS)
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    """처리되지 않은 오류를 기록합니다. 일시적인 네트워크 오류는 한 줄로만 남깁니다."""
+    error = context.error
+    # BadRequest 도 NetworkError 의 하위 클래스라서 따로 빼야 합니다.
+    if isinstance(error, NetworkError) and not isinstance(error, BadRequest):
+        # 라이브러리가 알아서 다시 시도하므로 traceback 까지 남길 필요는 없습니다.
+        logger.warning("텔레그램 네트워크 오류, 자동으로 재시도합니다: %s", error)
+        return
+    logger.error("처리되지 않은 오류가 발생했습니다.", exc_info=error)
+
+
 async def on_shutdown(application):
     """종료 시 SQLite 연결을 정상적으로 닫습니다."""
     database = application.bot_data.get("database")
@@ -328,6 +339,7 @@ def build_application(database):
     application.add_handler(CommandHandler("stop", stop_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(settings_callback))
+    application.add_error_handler(on_error)
 
     application.job_queue.run_repeating(
         check_notices_job,
